@@ -1,0 +1,13 @@
+실행 예시
+DB 업데이트만
+복사
+python update_member_info.py --csv input/member_update.csv
+DB 업데이트 + 사진 이름 변경
+복사
+python update_member_info.py --csv input/member_update.csv --rename-photos --photos-dir targetPhotos
+dry-run + 사진 테스트
+복사
+python update_member_info.py --csv input/member_update.csv --dry-run --rename-photos --photos-dir targetPhotos
+
+매우 중요한 주의점
+현재 코드에서는 --dry-run이어도 사진 파일명 변경은 실제로 실행됩니다.
