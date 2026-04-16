@@ -1,7 +1,6 @@
 import asyncio
 import csv
 import os
-import re  # 숫자 추출을 위한 정규표현식 모듈 추가
 from pathlib import Path
 from urllib.parse import quote_plus
 
@@ -10,10 +9,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 # 파일 경로 설정
 CSV_FILE_PATH = "C:\\Users\\djkim\\Desktop\\data_input.csv"
-ENV_FILE_PATH = "../.env"
-
-# 고정 클럽 번호
-CLUB_NO = 166
+ENV_FILE_PATH = "./.env"
 
 
 def load_dotenv_file(env_path: str = ENV_FILE_PATH) -> None:
@@ -105,14 +101,14 @@ def open_csv_dict_reader_with_fallback(csv_path: Path):
 
             reader.fieldnames = normalize_fieldnames(reader.fieldnames)
 
-            # 성명(또는 회원명), 입회 일자(또는 입회일자) 컬럼이 있는지 확인
-            has_name = any(col in reader.fieldnames for col in ["성명", "회원명"])
-            has_date = any(col in reader.fieldnames for col in ["입회 일자", "입회일자"])
+            # 성명(또는 회원명), 전화번호 컬럼이 있는지 확인
+            has_name = any(col in reader.fieldnames for col in ["성명", "회원명", "이름"])
+            has_phone = any(col in reader.fieldnames for col in ["전화번호", "연락처", "휴대폰", "핸드폰"])
 
-            if not has_name or not has_date:
+            if not has_name or not has_phone:
                 f.close()
                 raise ValueError(
-                    f"필수 컬럼('성명' 또는 '회원명', '입회 일자' 또는 '입회일자')이 없습니다. "
+                    f"필수 컬럼('성명' 관련, '전화번호' 관련)이 없습니다. "
                     f"현재 컬럼: {reader.fieldnames}"
                 )
 
@@ -133,38 +129,6 @@ def open_csv_dict_reader_with_fallback(csv_path: Path):
     raise RuntimeError("CSV 파일을 읽을 수 없습니다.")
 
 
-def format_date(date_str: str) -> str:
-    """
-    다양한 형태의 날짜 문자열을 'YYYY-MM-DD' 형태로 변환합니다.
-    연, 월만 있는 경우 해당 월의 1일로 자동 설정합니다.
-    """
-    if not date_str:
-        return None
-
-    # 정규표현식을 사용하여 문자열에서 숫자 덩어리만 추출
-    # 예: "1982. 12." -> ['1982', '12']
-    # 예: "1988-02" -> ['1988', '02']
-    numbers = re.findall(r'\d+', date_str)
-
-    try:
-        if len(numbers) >= 3:
-            # 연, 월, 일 모두 존재하는 경우
-            return f"{numbers[0]}-{int(numbers[1]):02d}-{int(numbers[2]):02d}"
-        elif len(numbers) == 2:
-            # 연, 월만 존재하는 경우 -> 무조건 1일로 설정
-            return f"{numbers[0]}-{int(numbers[1]):02d}-01"
-        elif len(numbers) == 1 and len(numbers[0]) == 8:
-            # "19821201" 처럼 붙어있는 경우
-            return f"{numbers[0][:4]}-{numbers[0][4:6]}-{numbers[0][6:]}"
-        elif len(numbers) == 1 and len(numbers[0]) == 6:
-            # "198212" 처럼 연월만 붙어있는 경우 -> 1일로 설정
-            return f"{numbers[0][:4]}-{numbers[0][4:]}-01"
-    except ValueError:
-        pass
-
-    return date_str  # 변환 실패 시 원본 반환
-
-
 async def main() -> None:
     csv_path = Path(CSV_FILE_PATH)
     if not csv_path.exists():
@@ -173,9 +137,9 @@ async def main() -> None:
     database_url = build_database_url()
     engine = create_async_engine(database_url, future=True)
 
-    updated = 0
-    inserted = 0
+    processed = 0
     skipped = 0
+    not_found_member = 0
     errors = 0
 
     try:
@@ -186,8 +150,8 @@ async def main() -> None:
             async with engine.begin() as conn:
                 for idx, row in enumerate(reader, start=2):
                     # 컬럼명 유연하게 가져오기
-                    member_name = (row.get("성명") or row.get("회원명") or "").strip()
-                    raw_date = (row.get("입회 일자") or row.get("입회일자") or "").strip()
+                    member_name = (row.get("성명") or row.get("회원명") or row.get("이름") or "").strip()
+                    phone_number = (row.get("전화번호") or row.get("연락처") or row.get("휴대폰") or row.get("핸드폰") or "").strip()
 
                     # 이름 끝에 'L' 또는 'l'이 있으면 제거
                     if member_name.endswith("L") or member_name.endswith("l"):
@@ -198,61 +162,65 @@ async def main() -> None:
                         skipped += 1
                         continue
 
-                    ent_date = format_date(raw_date)
+                    if not phone_number:
+                        print(f"[SKIP] {idx}행: '{member_name}' 회원의 전화번호가 비어 있습니다.")
+                        skipped += 1
+                        continue
 
                     try:
-                        # 1. 회원 존재 여부 확인 (clubNo=6 이고 이름이 같은 회원)
+                        # 1. chyMember에서 이름으로 memberNo 찾기
                         member_result = await conn.execute(
                             text(
                                 """
                                 SELECT memberNo
-                                FROM yk_members
-                                WHERE clubNo = :club_no
-                                  AND memberName = :member_name LIMIT 1
+                                FROM chyMember
+                                WHERE memberName = :member_name LIMIT 1
                                 """
                             ),
-                            {
-                                "club_no": CLUB_NO,
-                                "member_name": member_name,
-                            },
+                            {"member_name": member_name},
                         )
                         member_row = member_result.fetchone()
 
-                        if member_row:
-                            # 2-A. 회원이 존재하면 입회일자 업데이트
-                            member_no = member_row[0]
-                            await conn.execute(
-                                text(
-                                    """
-                                    UPDATE yk_members
-                                    SET memberEntdate = :ent_date
-                                    WHERE memberNo = :member_no
-                                    """
-                                ),
-                                {
-                                    "ent_date": ent_date,
-                                    "member_no": member_no,
-                                },
-                            )
-                            updated += 1
-                            print(f"[UPDATE] {idx}행: {member_name} (No.{member_no}) 입회일자 업데이트 완료 ({ent_date})")
-                        else:
-                            # 2-B. 회원이 없으면 신규 추가
-                            await conn.execute(
-                                text(
-                                    """
-                                    INSERT INTO yk_members (clubNo, memberName, memberEntdate)
-                                    VALUES (:club_no, :member_name, :ent_date)
-                                    """
-                                ),
-                                {
-                                    "club_no": CLUB_NO,
-                                    "member_name": member_name,
-                                    "ent_date": ent_date,
-                                },
-                            )
-                            inserted += 1
-                            print(f"[INSERT] {idx}행: {member_name} 신규 회원 추가 완료 ({ent_date})")
+                        if not member_row:
+                            print(f"[SKIP] {idx}행: '{member_name}' 회원을 chyMember에서 찾을 수 없습니다.")
+                            not_found_member += 1
+                            continue
+
+                        member_no = member_row[0]
+
+                        # 2. 기존 전화번호 정보(catNo=1) 업데이트 (이력 남기기)
+                        # 이전에 있던 동일한 memberNo, catNo=1 데이터의 attrib와 modDate를 수정
+                        await conn.execute(
+                            text(
+                                """
+                                UPDATE chyMemberInfo
+                                SET attrib  = 'XXXUPXXXUP',
+                                    modDate = NOW()
+                                WHERE memberNo = :member_no
+                                  AND catNo = 1
+                                  AND (attrib IS NULL OR attrib != 'XXXUPXXXUP')
+                                """
+                            ),
+                            {"member_no": member_no},
+                        )
+
+                        # 3. 새로운 전화번호 정보 인서트
+                        # 테이블 스키마에 따라 regDate나 다른 필수 컬럼이 있다면 추가해주세요.
+                        await conn.execute(
+                            text(
+                                """
+                                INSERT INTO chyMemberInfo (memberNo, catNo, infoContents)
+                                VALUES (:member_no, 1, :phone_number)
+                                """
+                            ),
+                            {
+                                "member_no": member_no,
+                                "phone_number": phone_number,
+                            },
+                        )
+
+                        processed += 1
+                        print(f"[SUCCESS] {idx}행: {member_name} 전화번호 업데이트 완료 ({phone_number})")
 
                     except Exception as e:
                         print(f"[ERROR] {idx}행 처리 중 오류 발생: {e}")
@@ -264,9 +232,9 @@ async def main() -> None:
         await engine.dispose()
 
     print("\n===== 처리 완료 =====")
-    print(f"UPDATE (기존회원 수정): {updated}건")
-    print(f"INSERT (신규회원 추가): {inserted}건")
-    print(f"SKIP (건너뜀): {skipped}건")
+    print(f"SUCCESS (전화번호 갱신 완료): {processed}건")
+    print(f"SKIP (이름/전화번호 없음): {skipped}건")
+    print(f"NOT FOUND (회원 정보 없음): {not_found_member}건")
     print(f"ERROR (오류): {errors}건")
 
 

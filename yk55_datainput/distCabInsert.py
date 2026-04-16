@@ -12,8 +12,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 CSV_FILE_PATH = r"C:\Users\djkim\Desktop\data_input.csv"
 ENV_FILE_PATH = "../.env"
 
-# 고정 클럽 번호
-CLUB_NO = 103
+# 고정 직급 번호 (rankNo)
+RANK_NO = 5
 
 
 def load_dotenv_file(env_path: str = ENV_FILE_PATH) -> None:
@@ -61,31 +61,25 @@ def build_database_url() -> str:
 def normalize_fieldnames(fieldnames: list[str] | None) -> list[str]:
     if not fieldnames:
         return []
-    # 띄어쓰기나 특수문자 등으로 인한 오류를 방지하기 위해 공백을 모두 제거하여 키값으로 사용
     return [name.strip().lstrip("\ufeff").replace(" ", "") if name else "" for name in fieldnames]
 
 
 def open_csv_dict_reader_with_fallback(csv_path: Path):
     encodings_to_try = ["utf-8-sig", "utf-8", "cp949", "euc-kr"]
     last_error = None
-
     for enc in encodings_to_try:
         try:
             f = csv_path.open("r", encoding=enc, newline="")
-            # 탭(\t) 분리 파일일 가능성도 있으므로 쉼표와 탭 모두 확인
             sample = f.read(1024)
             f.seek(0)
             delimiter = "\t" if "\t" in sample else ","
-
             reader = csv.DictReader(f, delimiter=delimiter)
             if reader.fieldnames is None:
                 f.close()
                 raise ValueError("CSV 헤더를 읽을 수 없습니다.")
-
             reader.fieldnames = normalize_fieldnames(reader.fieldnames)
             print(f"[INFO] CSV 인코딩 성공: {enc}, 구분자: {'TAB' if delimiter == chr(9) else 'COMMA'}")
             return f, reader, enc
-
         except Exception as e:
             last_error = e
 
@@ -94,49 +88,9 @@ def open_csv_dict_reader_with_fallback(csv_path: Path):
     raise RuntimeError("CSV 파일을 읽을 수 없습니다.")
 
 
-async def get_or_create_member(conn, club_no: int, member_name: str):
-    """
-    회원 이름으로 yk_members 테이블을 조회하여 memberNo를 반환합니다.
-    존재하지 않으면 새로 INSERT 한 후 생성된 memberNo를 반환합니다.
-    """
-    if not member_name:
-        return None
-
-    # 이름 정리 및 'L' 제거
-    name = member_name.strip()
-    if name.endswith("L") or name.endswith("l"):
-        name = name[:-1].strip()
-
-    if not name:
-        return None
-
-    # 1. 회원 조회
-    result = await conn.execute(
-        text("SELECT memberNo FROM yk_members WHERE clubNo = :club_no AND memberName = :name LIMIT 1"),
-        {"club_no": club_no, "name": name}
-    )
-    row = result.fetchone()
-
-    if row:
-        return row[0]
-
-    # 2. 회원이 없으면 신규 추가
-    insert_result = await conn.execute(
-        text("INSERT INTO yk_members (clubNo, memberName) VALUES (:club_no, :name)"),
-        {"club_no": club_no, "name": name}
-    )
-    # 새로 생성된 memberNo 반환
-    return insert_result.lastrowid
-
-
 def calculate_period_no(year_str: str) -> int:
-    """
-    '초대 (1960~1961)' 형태의 문자열에서 시작 연도를 추출하여 periodNo를 계산합니다.
-    1971~1972 가 1이므로, 1971년 미만은 0으로 처리합니다.
-    """
     if not year_str:
         return 0
-
     match = re.search(r'(\d{4})\s*~\s*(\d{4})', year_str)
     if match:
         start_year = int(match.group(1))
@@ -145,76 +99,116 @@ def calculate_period_no(year_str: str) -> int:
     return 0
 
 
+async def get_club(conn, club_name: str):
+    if not club_name:
+        return None
+    name = club_name.strip()
+    result = await conn.execute(
+        text("SELECT clubNo FROM yk_club WHERE clubName = :name LIMIT 1"),
+        {"name": name}
+    )
+    row = result.fetchone()
+    if row:
+        return row[0]
+    return None
+
+
+async def get_or_create_member(conn, club_no: int, member_name: str):
+    if not member_name or not club_no:
+        return None
+    name = member_name.strip()
+    if name.endswith("L") or name.endswith("l"):
+        name = name[:-1].strip()
+    if not name:
+        return None
+    result = await conn.execute(
+        text("SELECT memberNo FROM yk_members WHERE clubNo = :club_no AND memberName = :name LIMIT 1"),
+        {"club_no": club_no, "name": name}
+    )
+    row = result.fetchone()
+    if row:
+        return row[0]
+    insert_result = await conn.execute(
+        text("INSERT INTO yk_members (clubNo, memberName) VALUES (:club_no, :name)"),
+        {"club_no": club_no, "name": name}
+    )
+    return insert_result.lastrowid
+
+
 async def main() -> None:
     csv_path = Path(CSV_FILE_PATH)
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV 파일을 찾을 수 없습니다: {csv_path}")
-
     database_url = build_database_url()
     engine = create_async_engine(database_url, future=True)
-
     inserted = 0
+    updated = 0
+    skipped = 0
     errors = 0
-
     try:
         csv_file, reader, detected_encoding = open_csv_dict_reader_with_fallback(csv_path)
-
         try:
             async with engine.begin() as conn:
                 for idx, row in enumerate(reader, start=2):
-                    # 헤더의 공백을 모두 제거했으므로 키값도 공백 없이 접근
-                    year_str = row.get("년도별", "")
-
-                    # 각 직책별 이름 가져오기
-                    chairman_name = row.get("회장", "")
-                    vice1_name = row.get("제1부회장", "")
-                    vice2_name = row.get("제2부회장", "")
-                    vice3_name = row.get("제3부회장", "")
-                    sec_name = row.get("총무", "")
-                    tre_name = row.get("재무", "")
-                    lion_name = row.get("라이온테마", "")  # 공백 제거된 키
-                    tail_name = row.get("테일튀스터", "")  # 공백 제거된 키
-
-                    # periodNo 계산
-                    period_no = calculate_period_no(year_str)
-
+                    role_str = row.get("직책", "")
+                    period_str = row.get("임기", "")
+                    member_name = row.get("성명", "")
+                    club_name = row.get("소속", "")
+                    period_no = calculate_period_no(period_str)
                     try:
-                        # 각 직책별 memberNo 조회 또는 생성
-                        chairman_no = await get_or_create_member(conn, CLUB_NO, chairman_name)
-                        vice1_no = await get_or_create_member(conn, CLUB_NO, vice1_name)
-                        vice2_no = await get_or_create_member(conn, CLUB_NO, vice2_name)
-                        vice3_no = await get_or_create_member(conn, CLUB_NO, vice3_name)
-                        sec_no = await get_or_create_member(conn, CLUB_NO, sec_name)
-                        tre_no = await get_or_create_member(conn, CLUB_NO, tre_name)
-                        lion_no = await get_or_create_member(conn, CLUB_NO, lion_name)
-                        tail_no = await get_or_create_member(conn, CLUB_NO, tail_name)
+                        club_no = await get_club(conn, club_name)
+                        if club_no is None:
+                            print(f"[SKIP] {idx}행: '{club_name}' 클럽이 존재하지 않아 건너뜁니다.")
+                            skipped += 1
+                            continue
+                        member_no = await get_or_create_member(conn, club_no, member_name)
 
-                        # yk_clubStaff 테이블에 INSERT
-                        await conn.execute(
+                        # 이미 같은 데이터(periodNo, rankNo 기준)가 있는지 확인
+                        check_result = await conn.execute(
                             text(
-                                """
-                                INSERT INTO yk_clubStaff (periodNo, clubNo, chairmanNo, vice1stNo, vice2ndNo, vice3rdNo,
-                                                          secretaryNo, treasureNo, lionsteamerNo, tailtNo)
-                                VALUES (:period_no, :club_no, :chairman_no, :vice1_no, :vice2_no, :vice3_no,
-                                        :sec_no, :tre_no, :lion_no, :tail_no)
-                                """
-                            ),
-                            {
-                                "period_no": period_no,
-                                "club_no": CLUB_NO,
-                                "chairman_no": chairman_no,
-                                "vice1_no": vice1_no,
-                                "vice2_no": vice2_no,
-                                "vice3_no": vice3_no,
-                                "sec_no": sec_no,
-                                "tre_no": tre_no,
-                                "lion_no": lion_no,
-                                "tail_no": tail_no,
-                            },
+                                "SELECT dstaffNo FROM yk_distStaff WHERE periodNo = :period_no AND rankNo = :rank_no LIMIT 1"),
+                            {"period_no": period_no, "rank_no": RANK_NO}
                         )
-                        inserted += 1
-                        print(f"[INSERT] {idx}행: {year_str} (periodNo: {period_no}) 임원진 데이터 추가 완료")
-
+                        existing_row = check_result.fetchone()
+                        if existing_row:
+                            dist_staff_no = existing_row[0]
+                            await conn.execute(
+                                text(
+                                    """
+                                    UPDATE yk_distStaff
+                                    SET clubNo   = :club_no,
+                                        memberNo = :member_no,
+                                        memo1    = :memo1
+                                    WHERE dstaffNo = :dist_staff_no
+                                    """
+                                ),
+                                {
+                                    "club_no": club_no,
+                                    "member_no": member_no,
+                                    "memo1": role_str,
+                                    "dist_staff_no": dist_staff_no
+                                }
+                            )
+                            updated += 1
+                            print(f"[UPDATE] {idx}행: {period_str} (periodNo: {period_no}) 데이터 업데이트 완료")
+                        else:
+                            await conn.execute(
+                                text(
+                                    """
+                                    INSERT INTO yk_distStaff (periodNo, clubNo, rankNo, memberNo, memo1)
+                                    VALUES (:period_no, :club_no, :rank_no, :member_no, :memo1)
+                                    """
+                                ),
+                                {
+                                    "period_no": period_no,
+                                    "club_no": club_no,
+                                    "rank_no": RANK_NO,
+                                    "member_no": member_no,
+                                    "memo1": role_str
+                                }
+                            )
+                            inserted += 1
+                            print(f"[INSERT] {idx}행: {period_str} (periodNo: {period_no}) 데이터 추가 완료")
                     except Exception as e:
                         print(f"[ERROR] {idx}행 처리 중 오류 발생: {e}")
                         errors += 1
@@ -225,7 +219,9 @@ async def main() -> None:
         await engine.dispose()
 
     print("\n===== 처리 완료 =====")
-    print(f"INSERT (임원진 추가): {inserted}건")
+    print(f"INSERT (신규 추가): {inserted}건")
+    print(f"UPDATE (기존 수정): {updated}건")
+    print(f"SKIP (클럽 없음): {skipped}건")
     print(f"ERROR (오류): {errors}건")
 
 
